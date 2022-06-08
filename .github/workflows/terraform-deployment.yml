@@ -1,0 +1,128 @@
+on:
+  workflow_call:
+    inputs:
+      terraform-version:
+        required: true
+        type: string
+        default: 1.1.9
+      aws-region:
+        required: true
+        type: string
+      aws-account-name:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+    secrets:
+      aws-access-key-id:
+        required: true
+      aws-secret-access-key:
+        required: true
+
+env:
+  TERRAFORM_WORKSPACE: ${{ inputs.environment }}-${{ inputs.aws-region }}
+  TERRAFORM_BACKEND_CONFIG: -backend-config="region=${{ inputs.aws-region }}" -backend-config="bucket=terraform-state-${{ inputs.aws-account-name }}-${{ inputs.aws-region }}" -backend-config="dynamodb_table=terraform-state-${{ inputs.aws-account-name }}-${{ inputs.aws-region }}" # TODO: simplify this
+
+jobs:
+  Terraform:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v3
+
+      # Install Terraform
+      - uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      # Check the format of the Terraform template and fails the build when misformatted
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check
+
+      # Initialise Terraform
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init ${{ env.TERRAFORM_BACKEND_CONFIG }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.aws-secret-access-key }}
+          TF_INPUT: "0"
+          TF_IN_AUTOMATION: true
+
+      # Validate that the Terraform configuration is syntactically valid
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      # Terraform Workspace Selection
+      - name: Terraform Workspace Selection
+        run: |
+          terraform workspace new ${{ env.TERRAFORM_WORKSPACE }} || terraform workspace select ${{ env.TERRAFORM_WORKSPACE }}
+          terraform workspace show
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.aws-secret-access-key }}
+          TF_INPUT: "0"
+          TF_IN_AUTOMATION: true
+
+      # Terraform Plan
+      - name: Terraform Plan
+        id: plan
+        if: github.event_name == 'pull_request'
+        run: |
+          terraform plan -no-color -input=false
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.aws-secret-access-key }}
+          TF_INPUT: "0"
+          TF_IN_AUTOMATION: true
+
+      # Add a comment to the pull request with the results of the format, init and plan steps
+      - name: Update Pull Request
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      # Fail the build when the plan fails
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve -input=false
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.aws-secret-access-key }}
+          TF_INPUT: "0"
+          TF_IN_AUTOMATION: true
